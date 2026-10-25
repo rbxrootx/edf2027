@@ -24,6 +24,8 @@ REXCVAR_DEFINE_BOOL(edf_show_fps, false, "EDF2027", "Show the frame-rate overlay
 REXCVAR_DEFINE_BOOL(edf_frametime_log, false, "EDF2027", "Log frame-time statistics (min/avg/max/1% low) every 5 s");
 REXCVAR_DEFINE_BOOL(edf_native_memory_log, false, "EDF2027",
                     "Log process memory (private bytes, working set, handles) and the simulation tick count every 5 s beside the FPS line, for soak runs (tools/soak-report.py)");
+REXCVAR_DEFINE_BOOL(edf_mp_owner_correction_trace, false, "EDF2027/Multiplayer",
+                    "Log server-to-owner pose correction error every 10 seconds while connected");
 REXCVAR_DEFINE_BOOL(edf_trace_input, false, "EDF2027", "Log verbose guest input and XAM diagnostics");
 REXCVAR_DEFINE_BOOL(edf_rumble, true, "EDF2027", "Enable controller vibration");
 REXCVAR_DEFINE_INT32(edf_frame_pacer_spin_us, 250, "EDF2027",
@@ -56,6 +58,11 @@ REXCVAR_DEFINE_INT32(edf_perf_overlay_detail, 1, "EDF2027",
                      "Performance overlay (F2): 0 frame rate, 1 adds a frame-time graph, 2 adds CPU and GPU time").range(0, 2);
 REXCVAR_DEFINE_BOOL(edf_frame_pacer_before_present, true, "EDF2027",
                     "With the frame-rate unlock active and VSync off, pace capped frames before the guest present (steady present cadence) rather than after it (up to one period less latency, present times follow each frame's work)");
+REXCVAR_DEFINE_STRING(edf_server_directory, "", "EDF2027/Multiplayer",
+                      "Self-hosted server directory host:port used by the server browser");
+REXCVAR_DEFINE_INT32(edf_discovery_port, 27718, "EDF2027/Multiplayer",
+                     "LAN server discovery UDP port used by the server browser")
+    .range(1, 65535);
 
 #include <SDL3/SDL.h>
 #include <filesystem>

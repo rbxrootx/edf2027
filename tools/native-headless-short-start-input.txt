@@ -1,0 +1,4 @@
+# Short diagnostic title input: two separated Start presses.
+clock game
+2000 1000 0010
+4000 1000 0010

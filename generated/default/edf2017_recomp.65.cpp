@@ -1,5 +1,17 @@
 #include "edf2017_funcs.65.h"
 
+#if defined(EDF2027_GUEST_PROBE_TRACE)
+namespace edf::net::probe {
+void RecordRawVmDispatch(uint8_t* base, uint32_t context, uint32_t opcode,
+                         uint32_t phase, uint32_t event, uint32_t target,
+                         uint32_t callsite);
+void RecordMissionStartDispatch(uint8_t* base, uint32_t context, uint32_t opcode_pc,
+                               uint32_t fallthrough_pc, uint32_t event,
+                               uint32_t callback_target, uint32_t retry_byte_before,
+                               uint32_t retry_count_before, bool retry_branch_taken);
+}
+#endif
+
 DEFINE_REX_FUNC(sub_820A2858) {
 	REX_FUNC_PROLOGUE();
 	__fast_sub_820A2858(ctx, base, ctx.r1.u64, ctx.r3.u64, ctx.r4.u64, ctx.f1.f64, ctx.f2.f64);
@@ -16504,6 +16516,15 @@ DEFINE_REX_FUNC(sub_821DE3B0) {
 	uint64_t lr = ctx.lr;
 	PPCRegister temp{};
 	uint32_t ea{};
+#if defined(EDF2027_GUEST_PROBE_TRACE)
+	uint32_t opcode_pc = 0;
+	uint32_t fallthrough_pc = 0;
+	uint32_t callback_target = 0;
+	uint32_t dispatched_event = UINT32_MAX;
+	uint32_t retry_byte_before = 0;
+	uint32_t retry_count_before = 0;
+	bool retry_branch_taken = false;
+#endif
 	// mflr r12
 	r12.u64 = lr;
 	// bl 0x821e7f68
@@ -16524,6 +16545,9 @@ DEFINE_REX_FUNC(sub_821DE3B0) {
 	r24.u64 = REX_LOAD_U32(r28.u32 + 168);
 	// lwz r26,0(r29)
 	r26.u64 = REX_LOAD_U32(r29.u32 + 0);
+#if defined(EDF2027_GUEST_PROBE_TRACE)
+	opcode_pc = r26.u32;
+#endif
 	// mr r11,r26
 	r11.u64 = r26.u64;
 	// lbz r10,0(r11)
@@ -18900,6 +18924,12 @@ loc_821DF194:
 	ctx.r31 = r31;
 	ctx.ctr = ctr;
 	ctx.lr = lr;
+#if defined(EDF2027_GUEST_PROBE_TRACE)
+	callback_target = ctr.u32;
+	dispatched_event = r7.u32 & 0x1Fu;
+	edf::net::probe::RecordRawVmDispatch(base, r28.u32, r25.u32, r6.u32, r7.u32,
+	                                     ctr.u32, 0x821DF1B8);
+#endif
 	REX_CALL_INDIRECT_FUNC(ctr.u32);
 	r0 = ctx.r0;
 	r1 = ctx.r1;
@@ -19635,6 +19665,11 @@ loc_821DF38C:
 loc_821DF39C:
 	// lbz r11,60(r28)
 	r11.u64 = REX_LOAD_U8(r28.u32 + 60);
+#if defined(EDF2027_GUEST_PROBE_TRACE)
+	retry_byte_before = r11.u32;
+	retry_count_before = REX_LOAD_U32(r28.u32 + 72);
+	retry_branch_taken = retry_byte_before != 0;
+#endif
 	// cmplwi r11,0
 	cr0.compare<uint32_t>(r11.u32, 0, xer);
 	// beq 0x821df3c0
@@ -19657,6 +19692,12 @@ loc_821DF3C0:
 	// stw r27,72(r28)
 	REX_STORE_U32(r28.u32 + 72, r27.u32);
 loc_821DF3C8:
+#if defined(EDF2027_GUEST_PROBE_TRACE)
+	fallthrough_pc = REX_LOAD_U32(r28.u32 + 164);
+	edf::net::probe::RecordMissionStartDispatch(
+	    base, r28.u32, opcode_pc, fallthrough_pc, dispatched_event,
+	    callback_target, retry_byte_before, retry_count_before, retry_branch_taken);
+#endif
 	// lwz r11,0(r28)
 	r11.u64 = REX_LOAD_U32(r28.u32 + 0);
 	// mr r3,r25
@@ -56690,4 +56731,3 @@ extern "C" EDF_FAST_CC void __fast_sub_8253EFF0([[maybe_unused]] PPCContext& __r
 	ctx.r11 = r11;
 	return;
 }
-

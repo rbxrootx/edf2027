@@ -10,7 +10,7 @@ include(CTest)
 # The release version: the one place it lives. The game shows it (with the git commit,
 # tools/write-version.cmake) in its log and F1 menu, and package_release names the zip
 # after it.
-set(EDF2027_VERSION 0.3.0-beta)
+set(EDF2027_VERSION 0.3.38-beta)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -31,8 +31,38 @@ if(CMAKE_BUILD_TYPE MATCHES "^(Release|RelWithDebInfo|MinSizeRel)$" AND NOT EDF2
 endif()
 
 option(EDF2027_NATIVE_GRAPHICS_ONLY "Build native graphics tools without ReXGlue or Xenos" OFF)
+option(EDF2027_HEADLESS_SERVER_ONLY "Build only the standalone multiplayer server tools" OFF)
+option(EDF2027_BUILD_HEADLESS_GUEST_PROBE "Build an opt-in ReX headless guest simulation probe" OFF)
+option(EDF2027_SKIP_GUEST_PROBE_INSTRUMENTATION
+    "Build the headless guest probe without generated dispatch tracing (for stock ReXGlue codegen)" OFF)
+
+# The headless multiplayer service is independent of the ReXGlue runtime and the game
+# renderer, so it remains buildable on its own and is also available to dedicated hosts.
+option(EDF2027_BUILD_MULTIPLAYER "Build the multiplayer runtime and dedicated server" ON)
+if(EDF2027_BUILD_MULTIPLAYER)
+    set(LUAU_BUILD_CLI OFF CACHE BOOL "Do not build Luau command-line tools" FORCE)
+    set(LUAU_BUILD_TESTS OFF CACHE BOOL "Do not build Luau's upstream test suite" FORCE)
+    set(LUAU_BUILD_WEB OFF CACHE BOOL "Do not build Luau's Web module" FORCE)
+    add_subdirectory(third_party/enet EXCLUDE_FROM_ALL)
+    add_subdirectory(third_party/luau EXCLUDE_FROM_ALL)
+    add_subdirectory(src/multiplayer)
+endif()
+
+if(EDF2027_HEADLESS_SERVER_ONLY)
+    if(NOT EDF2027_BUILD_MULTIPLAYER)
+        message(FATAL_ERROR "EDF2027_HEADLESS_SERVER_ONLY requires EDF2027_BUILD_MULTIPLAYER=ON")
+    endif()
+    if(EDF2027_BUILD_HEADLESS_GUEST_PROBE)
+        message(FATAL_ERROR "EDF2027_BUILD_HEADLESS_GUEST_PROBE requires the ReXGlue game build; disable EDF2027_HEADLESS_SERVER_ONLY")
+    endif()
+    return()
+endif()
+
 add_subdirectory(src/native_graphics)
 if(EDF2027_NATIVE_GRAPHICS_ONLY)
+    if(EDF2027_BUILD_HEADLESS_GUEST_PROBE)
+        message(FATAL_ERROR "EDF2027_BUILD_HEADLESS_GUEST_PROBE requires the full ReXGlue game build; disable EDF2027_NATIVE_GRAPHICS_ONLY")
+    endif()
     return()
 endif()
 
@@ -41,6 +71,12 @@ if(NOT WIN32)
 endif()
 
 include(generated/rexglue.cmake)
+
+# The multiplayer fingerprint includes generated guest sources. Run codegen before
+# producing that header, then let every target that includes protocol.h wait for it.
+if(TARGET edf_port_build_fingerprint AND TARGET edf2017_codegen)
+    add_dependencies(edf_port_build_fingerprint edf2017_codegen)
+endif()
 
 # Guest codegen: the local ReXGlue codegen fork (docs/codegen-fork.md). The game keeps
 # linking the prebuilt SDK runtime; only the codegen tool differs. When
@@ -160,8 +196,132 @@ else()
     add_executable(edf2027 ${EDF2027_SOURCES})
 endif()
 
+if(EDF2027_BUILD_MULTIPLAYER)
+    target_compile_definitions(edf2027 PRIVATE EDF2027_BUILD_MULTIPLAYER=1)
+    target_link_libraries(edf2027 PRIVATE edf_multiplayer_client edf_multiplayer_server_core)
+    add_dependencies(edf2027 edf_port_build_fingerprint)
+endif()
+
 # The host owns native D3D12 rendering. Do not request an SDK GPU emulation plugin.
 rexglue_setup_target(edf2027)
+if(EDF2027_BUILD_HEADLESS_GUEST_PROBE)
+    # The generated call sites and their no-op providers are only present in the
+    # opt-in diagnostic configuration; ordinary performance builds compile neither.
+    if(NOT TARGET edf2027_recomp)
+        message(FATAL_ERROR "The generated guest probe instrumentation requires edf2027_recomp")
+    endif()
+    target_sources(edf2027 PRIVATE src/multiplayer/guest_probe_noop_hooks.cpp)
+    if(EDF2027_SKIP_GUEST_PROBE_INSTRUMENTATION)
+        message(STATUS "Guest probe dispatch tracing disabled for stock ReXGlue codegen")
+    else()
+        target_compile_definitions(edf2027_recomp PRIVATE EDF2027_GUEST_PROBE_TRACE=1)
+        add_custom_target(edf2017_guest_probe_instrumentation
+            COMMAND ${CMAKE_COMMAND}
+                "-DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}/generated/default/edf2017_recomp.65.cpp"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tools/instrument-guest-probe.cmake"
+            DEPENDS edf2017_codegen tools/instrument-guest-probe.cmake
+            COMMENT "Applying idempotent guest probe instrumentation"
+            VERBATIM)
+        add_dependencies(edf2027_recomp edf2017_guest_probe_instrumentation)
+        # The build fingerprint hashes generated/default/*.cpp. Ensure it sees the
+        # final post-codegen instrumentation state rather than racing the patch step.
+        if(TARGET edf_port_build_fingerprint)
+            add_dependencies(edf_port_build_fingerprint edf2017_guest_probe_instrumentation)
+        endif()
+    endif()
+endif()
+if(WIN32 AND EDF2027_BUILD_MULTIPLAYER)
+    add_custom_command(TARGET edf2027 POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:edf2027_sodium>" "$<TARGET_FILE_DIR:edf2027>"
+        VERBATIM)
+endif()
+
+# This probe deliberately links the same generated EDF guest code while bypassing
+# ReXApp and the native renderer. It verifies whether the real guest simulation
+# dispatcher advances with ReXGlue's tool_mode (GPU initialization skipped).
+if(EDF2027_BUILD_HEADLESS_GUEST_PROBE)
+    add_executable(edf2027_headless_probe
+        src/multiplayer/guest_probe_main.cpp
+        src/multiplayer/guest_probe_hooks.cpp
+        src/kernel_tick_timer.cpp)
+    target_include_directories(edf2027_headless_probe PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${REXGLUE_ENTRYPOINT_INCLUDE_DIR})
+    target_compile_definitions(edf2027_headless_probe PRIVATE EDF2027_HEADLESS_GUEST=1)
+    target_link_libraries(edf2027_headless_probe PRIVATE edf2027_recomp rex::runtime)
+    if(TARGET edf_multiplayer_protocol)
+        target_link_libraries(edf2027_headless_probe PRIVATE edf_multiplayer_protocol)
+    endif()
+    target_compile_features(edf2027_headless_probe PRIVATE cxx_std_23)
+    rexglue_apply_target_settings(edf2027_headless_probe)
+    add_dependencies(edf2027_headless_probe edf2017_codegen)
+    if(TARGET edf_port_build_fingerprint)
+        add_dependencies(edf2027_headless_probe edf_port_build_fingerprint)
+    endif()
+
+    # Match the runtime DLL staging normally supplied by rexglue_configure_target,
+    # without adding its windowed entry point or ReXApp implementation.
+    if(WIN32)
+        add_custom_command(TARGET edf2027_headless_probe POST_BUILD
+            COMMAND "$<$<BOOL:$<TARGET_RUNTIME_DLLS:edf2027_headless_probe>>:${CMAKE_COMMAND};-E;copy_if_different;$<TARGET_RUNTIME_DLLS:edf2027_headless_probe>;$<TARGET_FILE_DIR:edf2027_headless_probe>>"
+            COMMAND_EXPAND_LISTS
+            VERBATIM)
+        foreach(_edf_probe_fx amd_fidelityfx_vk amd_fidelityfx_dx12)
+            if(TARGET ${_edf_probe_fx})
+                add_custom_command(TARGET edf2027_headless_probe POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        $<TARGET_FILE:${_edf_probe_fx}>
+                        $<TARGET_FILE_DIR:edf2027_headless_probe>
+                    VERBATIM)
+            endif()
+        endforeach()
+    endif()
+
+    # Opt-in bridge host: the same real guest probe plus the self-hosted ENet
+    # service. The independent edf2027_server target remains available when no
+    # extracted game data or ReX runtime is present.
+    if(EDF2027_BUILD_MULTIPLAYER)
+        add_executable(edf2027_authoritative_host
+            src/multiplayer/guest_probe_main.cpp
+            src/multiplayer/guest_probe_hooks.cpp
+            src/kernel_tick_timer.cpp)
+        target_compile_definitions(edf2027_authoritative_host PRIVATE EDF2027_AUTHORITATIVE_HOST=1)
+        target_compile_definitions(edf2027_authoritative_host PRIVATE EDF2027_HEADLESS_GUEST=1)
+        target_include_directories(edf2027_authoritative_host PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${REXGLUE_ENTRYPOINT_INCLUDE_DIR})
+        target_link_libraries(edf2027_authoritative_host PRIVATE
+            edf2027_recomp rex::runtime edf_multiplayer_server_core)
+        target_compile_features(edf2027_authoritative_host PRIVATE cxx_std_23)
+        rexglue_apply_target_settings(edf2027_authoritative_host)
+        add_dependencies(edf2027_authoritative_host edf2017_codegen)
+        add_dependencies(edf2027_authoritative_host edf_port_build_fingerprint)
+        install(TARGETS edf2027_authoritative_host RUNTIME DESTINATION .)
+
+        if(WIN32)
+            add_custom_command(TARGET edf2027_authoritative_host POST_BUILD
+                COMMAND "$<$<BOOL:$<TARGET_RUNTIME_DLLS:edf2027_authoritative_host>>:${CMAKE_COMMAND};-E;copy_if_different;$<TARGET_RUNTIME_DLLS:edf2027_authoritative_host>;$<TARGET_FILE_DIR:edf2027_authoritative_host>>"
+                COMMAND_EXPAND_LISTS
+                VERBATIM)
+            add_custom_command(TARGET edf2027_authoritative_host POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "$<TARGET_FILE:edf2027_sodium>" "$<TARGET_FILE_DIR:edf2027_authoritative_host>"
+                VERBATIM)
+            foreach(_edf_host_fx amd_fidelityfx_vk amd_fidelityfx_dx12)
+                if(TARGET ${_edf_host_fx})
+                    add_custom_command(TARGET edf2027_authoritative_host POST_BUILD
+                        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                            $<TARGET_FILE:${_edf_host_fx}>
+                            $<TARGET_FILE_DIR:edf2027_authoritative_host>
+                        VERBATIM)
+                endif()
+            endforeach()
+        endif()
+    endif()
+endif()
 
 # Build identity (src/version.cpp): regenerated on every build, rewritten only when the
 # commit or the dirty flag changes, and seen only by version.cpp.
@@ -260,6 +420,12 @@ endif()
 option(EDF_CODEGEN_FORK_AUDIT "Codegen fork: link the differential audit and journal guest stores" OFF)
 if(EDF_CODEGEN_FORK_AUDIT)
     target_sources(edf2027 PRIVATE src/codegen_fork/ipa_audit.cpp)
+    if(EDF2027_BUILD_HEADLESS_GUEST_PROBE)
+        target_sources(edf2027_headless_probe PRIVATE src/codegen_fork/ipa_audit.cpp)
+        if(TARGET edf2027_authoritative_host)
+            target_sources(edf2027_authoritative_host PRIVATE src/codegen_fork/ipa_audit.cpp)
+        endif()
+    endif()
     target_precompile_headers(edf2027_recomp PRIVATE
         "${CMAKE_SOURCE_DIR}/src/codegen_fork/ipa_audit_pch.h")
     message(WARNING "EDF_CODEGEN_FORK_AUDIT: audit build (journaled guest stores)")

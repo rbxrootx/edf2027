@@ -24,6 +24,10 @@
 #include "pause_menu.h"
 #include "controller_logic.h"
 #include "manual_reload.h"
+#if defined(EDF2027_BUILD_MULTIPLAYER)
+#include "multiplayer/client_input.h"
+#include "multiplayer/local_server_host.h"
+#endif
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -48,6 +52,34 @@ REXCVAR_DECLARE(std::string, edf_pad_remap_p2);
 namespace {
 uint32_t g_calls = 0, g_last_rc = 0xFFFFFFFF;
 uint16_t g_last_btn = 0xFFFF;
+#if defined(EDF2027_BUILD_MULTIPLAYER)
+uint32_t g_remote_input_packet = 0;
+
+bool SafeRemoteInputStatePointer(uint32_t pointer, uint32_t stack_pointer) {
+  constexpr uint32_t size = sizeof(rex::input::X_INPUT_STATE);
+  if (!pointer || (pointer & 3u) || uint64_t(pointer) + size > uint64_t(UINT32_MAX) + 1)
+    return false;
+  const uint32_t distance = pointer > stack_pointer ? pointer - stack_pointer : stack_pointer - pointer;
+  return distance <= 0x10000u;
+}
+
+void InjectRemoteGuestInput(rex::input::X_INPUT_STATE& state,
+                            const edf::net::InputCommand& input) {
+  state.packet_number = ++g_remote_input_packet;
+  state.gamepad = {};
+  // An inactive authenticated peer can retain seat ownership while its native
+  // soldier respawns, but its stale buttons must never drive a live host seat.
+  // The game's revive/respawn control mapping has not been verified yet.
+  if (!input.gameplay_active) return;
+  state.gamepad.buttons = input.buttons;
+  state.gamepad.left_trigger = input.left_trigger;
+  state.gamepad.right_trigger = input.right_trigger;
+  state.gamepad.thumb_lx = input.move_x;
+  state.gamepad.thumb_ly = input.move_y;
+  state.gamepad.thumb_rx = input.aim_x;
+  state.gamepad.thumb_ry = input.aim_y;
+}
+#endif
 
 // The players' remap tables, parsed again only when their cvar text changes (the settings
 // menu edits them live). Guest pad polls can come from more than one thread.
@@ -109,6 +141,9 @@ void RoutePad(const uint8_t* base, uint32_t user, rex::input::X_INPUT_GAMEPAD& p
   if (routed.blank) {
     pad = rex::input::X_INPUT_GAMEPAD{};
     edf::pad::PublishSynthetic(int(user), 0);
+#if defined(EDF2027_BUILD_MULTIPLAYER)
+    if (user == 0) edf::net::PublishLocalInput({});
+#endif
     poll.blank = true;
     edf::reload::OnGuestPad(base, user, poll);
     return;
@@ -119,6 +154,19 @@ void RoutePad(const uint8_t* base, uint32_t user, rex::input::X_INPUT_GAMEPAD& p
   poll.game = pad.buttons;
   poll.reload_held = (synthetic >> unsigned(edf::pad::SyntheticAction::kReload)) & 1u;
   edf::reload::OnGuestPad(base, user, poll);
+#if defined(EDF2027_BUILD_MULTIPLAYER)
+  if (user == 0) {
+    edf::net::InputCommand input;
+    input.buttons = pad.buttons;
+    input.left_trigger = pad.left_trigger;
+    input.right_trigger = pad.right_trigger;
+    input.move_x = pad.thumb_lx;
+    input.move_y = pad.thumb_ly;
+    input.aim_x = pad.thumb_rx;
+    input.aim_y = pad.thumb_ry;
+    edf::net::PublishLocalInput(input);
+  }
+#endif
 }
 }  // namespace
 
@@ -128,11 +176,35 @@ REX_HOOK_RAW(sub_8212EA20) {
   const uint32_t user = ctx.r3.u32, ptr = ctx.r4.u32;
   __imp__sub_8212EA20(ctx, base);
   uint32_t rc = ctx.r3.u32;
+#if defined(EDF2027_BUILD_MULTIPLAYER)
+  // F5's authenticated remote pilot drives EDF's real second player object.
+  // Keep the native poll first so the runtime still refreshes device state, then
+  // replace the sample even when no physical controller is assigned to user 1.
+  if (user == 1 && SafeRemoteInputStatePointer(ptr, ctx.r1.u32)) {
+    std::optional<edf::net::InputCommand> remote_input;
+    const auto bridge = edf::GetLocalHostEngineBridge();
+    {
+      std::lock_guard bridge_lock(bridge->mutex);
+      if (bridge->host && bridge->host->running())
+        remote_input = bridge->host->RemoteGuestInput();
+    }
+    if (remote_input) {
+      auto* state = reinterpret_cast<rex::input::X_INPUT_STATE*>(base + ptr);
+      InjectRemoteGuestInput(*state, *remote_input);
+      edf::pad::PublishSynthetic(1, 0);
+      ctx.r3.u32 = 0;
+      return;
+    }
+  }
+#endif
   if (!ptr || rc != 0) {
     if (REXCVAR_GET(edf_trace_input) && user == 0 && rc != g_last_rc)
       REXLOG_INFO("XInputGetState hook: user={} rc={:#x} state={:#x}", user, rc, ptr);
     g_last_rc = rc;
     edf::pad::PublishSynthetic(int(user), 0);  // no pad: nothing held
+#if defined(EDF2027_BUILD_MULTIPLAYER)
+    if (user == 0) edf::net::PublishLocalInput({});
+#endif
     return;
   }
   auto* st = reinterpret_cast<rex::input::X_INPUT_STATE*>(base + ptr);

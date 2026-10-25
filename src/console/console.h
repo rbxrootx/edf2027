@@ -21,6 +21,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -35,6 +36,20 @@
 #include "console_logic.h"
 
 struct PPCContext;
+#if defined(EDF2027_BUILD_MULTIPLAYER)
+namespace edf::net {
+struct InputCommand;
+struct WorldSnapshot;
+struct ActorSnapshot;
+struct ActorState;
+struct ActorSpawnRequest;
+struct ActorDamageRequest;
+struct MissionActorIdentitySnapshot;
+struct MissionActorStateSnapshot;
+struct MissionActorRemovalSnapshot;
+struct MissionActorDamageRequest;
+}
+#endif
 
 namespace edf::console {
 
@@ -164,6 +179,75 @@ using EngineTick = std::function<void(EngineFrame&)>;
 void AddEngineTick(EngineTick tick);
 // console_game.cpp: registers the game commands and reports whether a mission is running.
 void RegisterGameCommands(Registry& registry);
+// True while EDF's mission world is loaded, including the interval where the
+// primary soldier is dead but another local co-op seat can still be active.
+bool MissionWorldActive(EngineFrame& frame);
 bool GameInMission(EngineFrame& frame);
+#if defined(EDF2027_BUILD_MULTIPLAYER)
+struct TrustedGuestPose {
+  bool available = false;
+  int32_t x_cm = 0;
+  int32_t y_cm = 0;
+  int32_t z_cm = 0;
+  int16_t yaw_mrad = 0;
+  bool health_valid = false;
+  bool alive = false;
+  uint16_t health = 0;
+  uint16_t max_health = 0;
+};
+struct TrustedGuestPositionReset {
+  uint16_t player_id = 0;
+  uint32_t reset_id = 0;
+  int32_t x_cm = 0;
+  int32_t y_cm = 0;
+  int32_t z_cm = 0;
+  int16_t yaw_mrad = 0;
+};
+struct TrustedGuestPositionResetAck {
+  uint16_t player_id = 0;
+  uint32_t reset_id = 0;
+};
+// Creates and validates EDF's native second player object for F5's remote seat.
+// Returns true only while a port-owned seat is available to receive network input.
+bool SyncLocalHostGuestSeat(EngineFrame& frame, bool remote_active,
+                            uint16_t remote_player_id, uint64_t connection_generation);
+TrustedGuestPose SampleGuestPlayerPose(EngineFrame& frame, uint32_t player_index);
+void MultiplayerEngineTick(EngineFrame& frame, bool connected, uint16_t local_player_id,
+                           bool server_authoritative_movement,
+                           edf::net::InputCommand& input, const edf::net::WorldSnapshot* snapshot,
+                           const edf::net::ActorSnapshot* actor_snapshot,
+                           TrustedGuestPose* trusted_guest_pose = nullptr,
+                           uint16_t host_guest_player_id = 0,
+                           const TrustedGuestPositionReset* host_guest_reset = nullptr,
+                           TrustedGuestPositionResetAck* host_guest_reset_ack = nullptr);
+// Diagnostic only: compare host ant samples with local mission ants without
+// creating, removing, or mutating guest objects.
+void TraceMissionActorShadowMatches(EngineFrame& frame, const edf::net::ActorSnapshot* snapshot);
+// Online spawn-key correlation is observational only. Local trace generations
+// are process-local and are never treated as shared mission identity.
+void TraceMissionActorIdentityMatches(
+    EngineFrame& frame, const edf::net::MissionActorIdentitySnapshot* snapshot);
+// Experimental: reconcile only exact, unique local mission-ant identities.
+void ReconcileMissionActorStates(
+    EngineFrame& frame, const edf::net::MissionActorStateSnapshot* snapshot,
+    bool host_owns_mission_simulation = false);
+// Applies only host-reported removals to exact, unique local mission-ant keys.
+void ReconcileMissionActorRemovals(
+    EngineFrame& frame, const edf::net::MissionActorRemovalSnapshot* snapshot);
+// Samples and damages exact mission ants on the game thread for an in-process
+// local server. The server worker only exchanges copied ActorState records and
+// spawn-key damage requests with these functions.
+std::vector<edf::net::ActorState> SampleHostMissionActors(EngineFrame& frame);
+size_t ApplyHostMissionActorDamage(
+    EngineFrame& frame, const std::vector<edf::net::MissionActorDamageRequest>& requests);
+// Creates Luau server-owned actors and applies their damage on the game thread.
+// Spawn requests contain only copied coordinates and IDs; guest pointers stay local.
+std::vector<uint32_t> UpdateHostServerActors(
+    EngineFrame& frame, const std::vector<edf::net::ActorSpawnRequest>& spawns,
+    std::vector<edf::net::ActorState>& actors_out);
+size_t ApplyHostServerActorDamage(
+    EngineFrame& frame, const std::vector<edf::net::ActorDamageRequest>& requests);
+void ClearHostServerActors(EngineFrame& frame);
+#endif
 
 }  // namespace edf::console

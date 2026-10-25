@@ -1,0 +1,5 @@
+# Check the title's Start and A confirm routes in a short scripted boot.
+clock game
+2000 500 0010
+4000 500 1000
+6000 500 0010

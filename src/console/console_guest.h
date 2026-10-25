@@ -12,6 +12,7 @@
 #pragma once
 
 #include <rex/ppc/context.h>
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstdint>
@@ -43,7 +44,9 @@ class GuestMemory {
     return a >= 0x40000000u && a < 0x50000000u && a + size <= 0x50000000u && (a & 3) == 0;
   }
   // Code, vtables, RTTI and globals: the executable image.
-  static bool Image(uint32_t a, uint32_t size = 4) { return a >= 0x82000000u && a + size <= 0x82600000u; }
+  static bool Image(uint32_t a, uint32_t size = 4) {
+    return a >= 0x82000000u && uint64_t(a) + size <= 0x82600000u;
+  }
 
   // The RTTI class name of an object ("clGiantAnt"), or "" when its vtable does not lead
   // to a well-formed MSVC type descriptor: vtable[-1] is the complete-object locator,
@@ -58,10 +61,13 @@ class GuestMemory {
     if (!Image(locator, 16)) return {};
     const uint32_t descriptor = U32(locator + 12);
     if (!Image(descriptor, 12)) return {};
-    const char* name = reinterpret_cast<const char*>(Ptr(descriptor + 8));
+    const uint32_t name_address = descriptor + 8;
+    if (!Image(name_address, 4)) return {};
+    const size_t name_bytes = (std::min)(size_t{96}, size_t(0x82600000u - name_address));
+    const char* name = reinterpret_cast<const char*>(Ptr(name_address));
     if (std::strncmp(name, ".?AV", 4) != 0) return {};
     std::string out;
-    for (size_t i = 4; i < 96 && name[i] && name[i] != '@'; ++i) out += name[i];
+    for (size_t i = 4; i < name_bytes && name[i] && name[i] != '@'; ++i) out += name[i];
     return out;
   }
 

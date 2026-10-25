@@ -1,0 +1,21 @@
+# Headless XEX host route using the established benchmark title/menu timing.
+# Clock is guest game time, so loading screens do not change input spacing.
+clock game
+# Two Start taps, then the same spaced A confirmations as the benchmark route.
+# Keep taps short so XInput does not emit repeat pulses during each press.
+20000 150 0010
+25000 150 0010
+30000 150 1000
+35000 150 1000
+40000 150 1000
+45000 150 1000
+50000 150 1000
+55000 150 1000
+60000 150 1000
+65000 150 1000
+70000 150 1000
+# Start skips the opening intro after it becomes skippable. A second Start
+# would open the pause menu, so keep this as a single short press.
+85000 500 0010
+# The street loads after the skip; hold fire shortly after gameplay entry.
+100000 300000 0000 0 255 0 0 0 0

@@ -8,4 +8,5 @@ namespace edf {
 // runtime is set up and before the guest runs; Stop before the runtime goes away.
 void StartKernelTickTimer(rex::Runtime* runtime);
 void StopKernelTickTimer();
+bool KernelTickTimerRunning() noexcept;
 }  // namespace edf

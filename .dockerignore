@@ -1,0 +1,9 @@
+.git
+.github
+out
+build
+cmake-build-*
+generated/default
+*.xex
+*.XEX
+server-data

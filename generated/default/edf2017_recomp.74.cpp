@@ -1,5 +1,9 @@
 #include "edf2017_funcs.74.h"
 
+namespace edf::net::probe {
+void RecordTitleConfirmCompare(uint8_t* base, uint32_t object, uint32_t result);
+}
+
 DEFINE_REX_FUNC(sub_820A2CA8) {
 	REX_FUNC_PROLOGUE();
 	PPCRegister r1 = ctx.r1;
@@ -2084,11 +2088,13 @@ extern "C" EDF_FAST_CC void __fast_sub_820C59A0([[maybe_unused]] PPCContext& __r
 	r31.u64 = REX_LOAD_U32(r11.u32 + 256);
 	// lwz r3,-31076(r10)
 	r3.u64 = REX_LOAD_U32(r10.u32 + -31076);
+	const uint32_t confirm_compare_object = r3.u32;
 	// bl 0x820c2640
 	lr = 0x820C59C4;
 	ctx.r10 = r10;
 	__fast_sub_820C2640(ctx, base, r3.u64);
 	r3 = ctx.r3;
+	edf::net::probe::RecordTitleConfirmCompare(base, confirm_compare_object, r3.u32);
 	r10 = ctx.r10;
 	r11 = ctx.r11;
 	// clrlwi r11,r3,24
@@ -55456,4 +55462,3 @@ loc_825494B0:
 	ctx.cr6 = cr6;
 	return;
 }
-

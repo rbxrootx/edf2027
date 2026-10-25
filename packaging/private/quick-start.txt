@@ -1,0 +1,69 @@
+EDF2027 PRIVATE PERSONAL TEST BUILD 0.3.38-beta
+
+The game data is installed in the "game" folder beside EDF2027.exe. Use the
+installed EDF2027 shortcut; it passes --game_data_root automatically, so the
+first launch does not need the setup screen or a manual asset copy.
+
+TWO-CLIENT TEST ON ONE PC
+1. Launch EDF2027 on the host PC and press F5.
+2. Enter a player name and select Host local and join.
+3. Launch a second client on the same PC or another LAN PC. In F5, enter a
+   different player name. For another LAN PC, enter the host's IPv4 address
+   followed by :27717 and select Join address.
+4. Close F5 in both clients and start the same mission.
+5. Active nearby players appear as remote soldier replicas. After everyone
+   connects, load the same mission on each client. Each EDF guest retains its
+   own mission spawn and movement physics; F5 relays bounded client poses. The host shares up to 48
+   matched mission ants at 5 Hz and applies the bundled server-selected custom
+   trigger damage. Mission starts, EDF weapons, AI, objectives, and effects are
+   not yet server-authoritative or synchronized.
+
+RENDERED LOCAL HOST
+The F5 "Host local and join" option runs the server inside the rendered game and
+samples its live mission ant state on the game thread. Start the same mission on
+each client. Bounded spawn identities are tracked from mission start, so a
+client can connect after the mission has begun. Host pose/health/removal writes
+are experimental and disabled by default. To try them on a client, explicitly
+set `edf_mp_mission_actor_reconcile=true`; host and client spawn ordinals do not
+prove that their mission instances or ant identities match, so use this only
+for a controlled same-mission test. With the cvar off, players still connect
+and move, while each client runs its own ants and combat. The bundled Luau
+policy applies its own fixed 25-point damage for a right-trigger press; this
+does not reproduce EDF weapon hits or host-side weapon effects.
+
+LAN TEST
+Use the server PC's LAN IPv4 address followed by :27717 in each client's F5
+Address field. Allow UDP 27717 through the host firewall. UDP 27718 is used only
+for optional Refresh LAN discovery.
+
+OPTIONAL SELF-HOSTED DIRECTORY
+Start edf2027_master.exe (UDP 27719), then start the dedicated server with
+--master "127.0.0.1:27719" and --advertise-ip <reachable IPv4>. Remote players
+can enter the directory host:port in F5 and choose Query directory. Forward UDP
+27717 for gameplay and UDP 27719 for the directory as appropriate.
+
+EXPERIMENTAL HEADLESS GUEST-BACKED HOST
+Use the "Experimental Guest-Backed Host" shortcut to start a headless EDF guest
+and server together. Its bundled input route starts the title sequence at 20
+seconds of guest game time, skips the intro at 85 seconds, and begins gameplay
+input at 100 seconds. The shortcut also logs the guest input call sites that
+receive the scripted Start/A presses. The route is experimental
+and has not yet been demonstrated to reach Mission 1. The first active network
+pilot is simulated by the guest's EDF movement; additional players do not yet
+own separate EDF guest soldiers. The host shares matched mission-ant pose and
+health and the bundled Luau policy accepts custom server-selected damage; it
+does not reproduce EDF weapons, AI, objectives, or effects. This headless
+mission route remains experimental; the rendered local-host option above is
+the recommended in-game host path.
+
+TRUSTED SERVER SCRIPTS
+The installed server-data/scripts folder includes the trusted
+server_owned_ant_combat.luau policy and loads it on server start. It handles
+headless demo ants and accepts custom damage against host-sampled mission ants
+when using the rendered local host. You can edit or remove it to change that policy.
+Only run trusted Luau scripts. Gameplay connections authenticate a persistent
+server key and encrypt packets. The first connection saves a per-user key pin;
+the F5 status displays its fingerprint, and later key changes fail closed.
+Back up server-data/identity.edfkey with the server data. Player accounts and
+anti-cheat are not implemented, and full server-authoritative EDF combat is
+still incomplete.

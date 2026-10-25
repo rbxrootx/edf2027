@@ -8,17 +8,29 @@
 #include <rex/audio/audio_system.h>
 #include <rex/audio/sdl/sdl_audio_system.h>
 #include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/logging.h>
 #include <rex/ui/keybinds.h>
+#include <algorithm>
 #include <condition_variable>
 #include <deque>
 #include <filesystem>
 #include <mutex>
 #include <thread>
+#include <utility>
+#include <vector>
 #include "console/console_dialog.h"
+#include "console/console.h"
 #include "diagnostics.h"
 #include "kernel_tick_timer.h"
 #include "launcher.h"
+#if defined(EDF2027_BUILD_MULTIPLAYER)
+#include "multiplayer/client_input.h"
+#include "multiplayer/client_session.h"
+#include "multiplayer/local_server_host.h"
+#include "multiplayer/mission_actor_trace.h"
+#include "multiplayer/server_browser_dialog.h"
+#endif
 #include "pause_menu.h"
 #include "perf_overlay.h"
 #include "scripted_input.h"
@@ -52,8 +64,12 @@ REXCVAR_DECLARE(bool, edf_menu_mute_audio);
 REXCVAR_DECLARE(bool, edf_menu_pause_audio_engine);
 REXCVAR_DECLARE(std::string, hid_mappings_file);
 REXCVAR_DECLARE(bool, edf_console_pause);
+#if defined(EDF2027_BUILD_MULTIPLAYER)
+REXCVAR_DECLARE(bool, edf_mp_actor_trace);
+#endif
 
 namespace edf {
+
 // Suspends and resumes the SDK audio engine (AudioSystem::Pause/Resume) for the F1
 // pause, on a thread of its own: Pause waits for the audio worker to acknowledge, and
 // the UI thread must never wait on anything the game owns. Requests run in order, so a
@@ -359,6 +375,258 @@ class Edf2017App : public rex::ReXApp {
     rex::ui::RegisterBind("bind_edf_fps", "F2", "Toggle performance overlay", []() {
       rex::cvar::SetFlagByName("edf_show_fps", REXCVAR_GET(edf_show_fps) ? "false" : "true");
     });
+#if defined(EDF2027_BUILD_MULTIPLAYER)
+    rex::ui::RegisterBind("bind_edf_servers", "F5", "Open server browser", [this]() { OpenServerBrowser(); });
+    const auto host_bridge = edf::GetLocalHostEngineBridge();
+    {
+      std::lock_guard bridge_lock(host_bridge->mutex);
+      host_bridge->host = &local_server_host_;
+    }
+    static std::once_flag network_tick;
+    std::call_once(network_tick, [host_bridge] {
+      static uint64_t snapshot_generation = 0;
+      static uint64_t actor_snapshot_generation = 0;
+      static uint64_t mission_actor_diagnostic_generation = 0;
+      static uint64_t mission_actor_identity_generation = 0;
+      static uint64_t mission_actor_state_generation = 0;
+      static uint64_t mission_actor_removal_generation = 0;
+      static uint64_t local_host_run_generation = 0;
+      static uint64_t connection_epoch = 0;
+      static uint16_t local_player_id = 0;
+      static uint32_t last_mission_actor_diagnostic_log_tick = 0;
+      static std::vector<uint32_t> last_mission_actor_diagnostic_ids;
+      static edf::net::WorldSnapshot latest_snapshot;
+      static edf::net::ActorSnapshot latest_actor_snapshot;
+      static edf::net::ActorSnapshot latest_mission_actor_diagnostic_snapshot;
+      static edf::net::MissionActorIdentitySnapshot latest_mission_actor_identity_snapshot;
+      static edf::net::MissionActorStateSnapshot latest_mission_actor_state_snapshot;
+      static edf::net::MissionActorRemovalSnapshot latest_mission_actor_removal_snapshot;
+      edf::console::AddEngineTick([host_bridge, generation = &snapshot_generation, local_id = &local_player_id,
+                                   session_epoch = &connection_epoch,
+                                   snapshot = &latest_snapshot, actor_generation = &actor_snapshot_generation,
+                                   actor_snapshot = &latest_actor_snapshot,
+                                   diagnostic_generation = &mission_actor_diagnostic_generation,
+                                   diagnostic_log_tick = &last_mission_actor_diagnostic_log_tick,
+                                   diagnostic_ids = &last_mission_actor_diagnostic_ids,
+                                   diagnostic_snapshot = &latest_mission_actor_diagnostic_snapshot,
+                                   identity_generation = &mission_actor_identity_generation,
+                                   identity_snapshot = &latest_mission_actor_identity_snapshot,
+                                   state_generation = &mission_actor_state_generation,
+                                   state_snapshot = &latest_mission_actor_state_snapshot,
+                                   removal_generation = &mission_actor_removal_generation,
+                                   removal_snapshot = &latest_mission_actor_removal_snapshot,
+                                   host_run_generation = &local_host_run_generation](edf::console::EngineFrame& frame) {
+        std::lock_guard bridge_lock(host_bridge->mutex);
+        auto* local_host = host_bridge->host;
+        auto& session = edf::net::ClientSession::Global();
+        uint64_t current_epoch = 0;
+        const bool connected = session.connected(current_epoch);
+        const bool local_host_running = local_host && local_host->running();
+        const uint64_t current_host_generation = local_host ? local_host->run_generation() : 0;
+        const bool network_mission_active = connected || local_host_running;
+        if (local_host) local_host->SetLocalPlayerId(connected ? session.local_player_id() : 0);
+        const edf::net::RemoteGuestIdentity remote_guest_identity = local_host
+            ? local_host->PendingRemoteGuestIdentity() : edf::net::RemoteGuestIdentity{};
+        const bool remote_guest_seat_ready = edf::console::SyncLocalHostGuestSeat(
+            frame, local_host_running && remote_guest_identity.player_id != 0,
+            remote_guest_identity.player_id, remote_guest_identity.connection_generation);
+        if (local_host) {
+          local_host->SetRemoteGuestSeatReady(remote_guest_identity, remote_guest_seat_ready);
+        }
+        const uint16_t host_guest_player_id =
+            local_host_running ? local_host->RemoteGuestPlayerId() : 0;
+        if (!network_mission_active &&
+            edf::multiplayer::MissionActorNetworkReplicationActive()) {
+          // Restore any local replica flags while the trace keys are still
+          // available, then stop collecting them for ordinary single-player.
+          edf::console::ReconcileMissionActorStates(frame, nullptr, true);
+        }
+        edf::multiplayer::SetMissionActorNetworkReplicationActive(network_mission_active);
+        if (local_host_running) {
+          if (*host_run_generation != current_host_generation) {
+            // A host restart can reuse server actor IDs while the game mission
+            // remains loaded. Retire the previous run's native actor map first.
+            edf::console::ClearHostServerActors(frame);
+            *host_run_generation = current_host_generation;
+          }
+          // Mission trace state may remain nonzero after leaving a mission.
+          // Do not let Luau reserve actor IDs while the menu/loading scene is
+          // active: the native game-thread bridge cannot create those actors.
+          const uint64_t trace_generation = edf::console::MissionWorldActive(frame)
+              ? edf::multiplayer::CurrentMissionAntTraceGeneration() : 0;
+          local_host->SetServerActorWorldGeneration(trace_generation);
+          local_host->PublishMissionActors(
+              trace_generation, edf::console::SampleHostMissionActors(frame));
+          const auto spawn_requests = local_host->TakeServerActorSpawnRequests();
+          std::vector<edf::net::ActorState> server_actors;
+          const auto spawned_ids = edf::console::UpdateHostServerActors(
+              frame, spawn_requests, server_actors);
+          local_host->PublishServerActors(trace_generation, std::move(server_actors));
+          local_host->CompleteServerActorSpawns(spawn_requests, spawned_ids);
+          const auto server_damage_requests = local_host->TakeServerActorDamageRequests();
+          (void)edf::console::ApplyHostServerActorDamage(frame, server_damage_requests);
+          const auto damage_requests = local_host->TakeMissionActorDamageRequests();
+          (void)edf::console::ApplyHostMissionActorDamage(frame, damage_requests);
+        } else {
+          edf::console::ClearHostServerActors(frame);
+          *host_run_generation = 0;
+        }
+        if (current_epoch != *session_epoch) {
+          *session_epoch = current_epoch;
+          *snapshot = {};
+          *actor_snapshot = {};
+          *diagnostic_snapshot = {};
+          *identity_snapshot = {};
+          *state_snapshot = {};
+          *removal_snapshot = {};
+          *generation = 0;
+          *actor_generation = 0;
+          *diagnostic_generation = 0;
+          *identity_generation = 0;
+          *state_generation = 0;
+          *removal_generation = 0;
+          *diagnostic_log_tick = 0;
+          diagnostic_ids->clear();
+          *local_id = 0;
+          edf::console::TraceMissionActorShadowMatches(frame, nullptr);
+          if (connected) {
+            // A reconnect may complete between engine ticks. Run the normal
+            // disconnect cleanup before using any state from the new server.
+            edf::net::InputCommand cleanup;
+            edf::console::MultiplayerEngineTick(frame, false, 0, false, cleanup, nullptr, nullptr);
+          }
+        }
+        edf::console::TrustedGuestPositionResetAck host_guest_reset_ack;
+        if (connected) {
+          auto input = edf::net::PublishedLocalInput();
+          (void)session.CopySnapshotIfNew(*generation, *snapshot, *local_id);
+          (void)session.CopyActorSnapshotIfNew(*actor_generation, *actor_snapshot);
+          const bool got_diagnostic_snapshot = session.CopyMissionActorDiagnosticSnapshotIfNew(
+              *diagnostic_generation, *diagnostic_snapshot);
+          const bool got_identity_snapshot = session.CopyMissionActorIdentitySnapshotIfNew(
+              *identity_generation, *identity_snapshot);
+          (void)session.CopyMissionActorStateSnapshotIfNew(
+              *state_generation, *state_snapshot);
+          (void)session.CopyMissionActorRemovalSnapshotIfNew(
+              *removal_generation, *removal_snapshot);
+          edf::console::TrustedGuestPose host_guest_pose;
+          edf::console::TrustedGuestPositionReset host_guest_reset;
+          std::optional<edf::net::AuthoritativePositionReset> pending_host_guest_reset;
+          if (local_host_running) {
+            pending_host_guest_reset = local_host->PendingRemoteGuestReset();
+            if (pending_host_guest_reset) {
+              host_guest_reset = {pending_host_guest_reset->player_id,
+                  pending_host_guest_reset->reset_id, pending_host_guest_reset->x_cm,
+                  pending_host_guest_reset->y_cm, pending_host_guest_reset->z_cm,
+                  pending_host_guest_reset->yaw_mrad};
+            }
+          }
+          const bool actor_trace_enabled = REXCVAR_GET(edf_mp_actor_trace);
+          if (got_diagnostic_snapshot && actor_trace_enabled) {
+            std::vector<uint32_t> current_ids;
+            current_ids.reserve(diagnostic_snapshot->actors.size());
+            for (const auto& actor : diagnostic_snapshot->actors) current_ids.push_back(actor.id);
+            std::sort(current_ids.begin(), current_ids.end());
+            const bool actor_set_changed = current_ids != *diagnostic_ids;
+            if (actor_set_changed || *diagnostic_log_tick == 0 ||
+                static_cast<int32_t>(diagnostic_snapshot->tick - *diagnostic_log_tick) >= 60) {
+              *diagnostic_ids = std::move(current_ids);
+              *diagnostic_log_tick = diagnostic_snapshot->tick;
+              REXLOG_INFO("Mission actor network trace: side=client_remote tick={} count={}",
+                          diagnostic_snapshot->tick, diagnostic_snapshot->actors.size());
+              for (const auto& actor : diagnostic_snapshot->actors)
+                REXLOG_INFO("Mission actor network trace: side=client_remote tick={} id={} health={} x_cm={} y_cm={} z_cm={} yaw_mrad={}",
+                            diagnostic_snapshot->tick, actor.id, actor.health, actor.x_cm, actor.y_cm,
+                            actor.z_cm, actor.yaw_mrad);
+            }
+          }
+          if (!actor_trace_enabled || !edf::console::MissionWorldActive(frame)) {
+            edf::console::TraceMissionActorShadowMatches(frame, nullptr);
+          } else if (got_diagnostic_snapshot) {
+            edf::console::TraceMissionActorShadowMatches(
+                frame, diagnostic_snapshot->tick ? diagnostic_snapshot : nullptr);
+          }
+          if (!actor_trace_enabled || !edf::console::MissionWorldActive(frame)) {
+            edf::console::TraceMissionActorIdentityMatches(frame, nullptr);
+          } else if (got_identity_snapshot && identity_snapshot->host_trace_generation) {
+            edf::console::TraceMissionActorIdentityMatches(frame, identity_snapshot);
+          } else if (got_identity_snapshot) {
+            edf::console::TraceMissionActorIdentityMatches(frame, nullptr);
+          }
+          edf::console::ReconcileMissionActorStates(
+              frame, state_snapshot->tick ? state_snapshot : nullptr,
+              local_host_running);
+          edf::console::ReconcileMissionActorRemovals(
+              frame, removal_snapshot->tick ? removal_snapshot : nullptr);
+          edf::console::MultiplayerEngineTick(frame, true, *local_id,
+              session.server_authoritative_movement(), input,
+              snapshot->tick ? snapshot : nullptr,
+              !local_host_running && actor_snapshot->tick ? actor_snapshot : nullptr,
+              local_host_running ? &host_guest_pose : nullptr, host_guest_player_id,
+              pending_host_guest_reset ? &host_guest_reset : nullptr, &host_guest_reset_ack);
+          session.SetInput(input);
+          if (local_host_running && *local_id) {
+            edf::net::AuthoritativePlayerTransform host_transform;
+            host_transform.player_id = *local_id;
+            host_transform.available = input.gameplay_active && host_guest_pose.available;
+            host_transform.acknowledged_reset_player_id = input.position_reset_ack ? *local_id : 0;
+            host_transform.acknowledged_reset_id = input.position_reset_ack;
+            host_transform.x_cm = host_guest_pose.available ? host_guest_pose.x_cm : 0;
+            host_transform.y_cm = host_guest_pose.available ? host_guest_pose.y_cm : 0;
+            host_transform.z_cm = host_guest_pose.available ? host_guest_pose.z_cm : 0;
+            host_transform.yaw_mrad = host_guest_pose.yaw_mrad;
+            host_transform.health_valid = host_guest_pose.health_valid;
+            host_transform.alive = host_guest_pose.alive;
+            host_transform.health = host_guest_pose.health;
+            host_transform.max_health = host_guest_pose.max_health;
+            local_host->PublishHostTransform(host_transform);
+          } else if (local_host_running) {
+            local_host->ClearHostTransform();
+          }
+        } else {
+          if (local_host_running) local_host->ClearHostTransform();
+          *snapshot = {};
+          *actor_snapshot = {};
+          *diagnostic_snapshot = {};
+          *identity_snapshot = {};
+          *state_snapshot = {};
+          *removal_snapshot = {};
+          diagnostic_ids->clear();
+          *local_id = 0;
+          edf::console::TraceMissionActorShadowMatches(frame, nullptr);
+          edf::console::TraceMissionActorIdentityMatches(frame, nullptr);
+          edf::console::ReconcileMissionActorStates(frame, nullptr);
+          edf::console::ReconcileMissionActorRemovals(frame, nullptr);
+          edf::net::InputCommand input;
+          edf::console::MultiplayerEngineTick(frame, false, 0, false, input, nullptr, nullptr);
+        }
+        if (local_host_running) {
+          const uint16_t remote_player_id = local_host->RemoteGuestPlayerId();
+          if (remote_player_id) {
+            const auto guest_pose = edf::console::SampleGuestPlayerPose(frame, 1);
+            edf::net::AuthoritativePlayerTransform remote_transform;
+            remote_transform.player_id = remote_player_id;
+            remote_transform.available = guest_pose.available;
+            remote_transform.x_cm = guest_pose.x_cm;
+            remote_transform.y_cm = guest_pose.y_cm;
+            remote_transform.z_cm = guest_pose.z_cm;
+            remote_transform.yaw_mrad = guest_pose.yaw_mrad;
+            remote_transform.health_valid = guest_pose.health_valid;
+            remote_transform.alive = guest_pose.alive;
+            remote_transform.health = guest_pose.health;
+            remote_transform.max_health = guest_pose.max_health;
+            if (host_guest_reset_ack.player_id == remote_player_id) {
+              remote_transform.acknowledged_reset_player_id = host_guest_reset_ack.player_id;
+              remote_transform.acknowledged_reset_id = host_guest_reset_ack.reset_id;
+            }
+            local_host->PublishRemoteGuestTransform(remote_transform);
+          } else {
+            local_host->ClearRemoteGuestTransform();
+          }
+        }
+      });
+    });
+#endif
     CreateConsole(drawer);
     // The pad chord (edf_menu_pad_chord) is seen on the guest's pad poll; open the menu
     // from the UI thread.
@@ -398,6 +666,14 @@ class Edf2017App : public rex::ReXApp {
   }
 
   void OnShutdown() override {
+    SaveConfig();
+#if defined(EDF2027_BUILD_MULTIPLAYER)
+    server_browser_scans_.StopAndJoin();
+    edf::net::ClientSession::Global().Disconnect();
+    DetachLocalServerHostFromEngine();
+    local_server_host_.Stop();
+    edf::multiplayer::SetMissionActorNetworkReplicationActive(false);
+#endif
     ReleasePause();
     edf::StopKernelTickTimer();  // while the runtime and guest memory are still up
 #if defined(_WIN32)
@@ -413,6 +689,12 @@ class Edf2017App : public rex::ReXApp {
   }
   bool OnWindowCloseRequested() override {
     // The engine thread must not stay held in the heartbeat while the runtime stops.
+#if defined(EDF2027_BUILD_MULTIPLAYER)
+    edf::net::ClientSession::Global().Disconnect();
+    DetachLocalServerHostFromEngine();
+    local_server_host_.Stop();
+    edf::multiplayer::SetMissionActorNetworkReplicationActive(false);
+#endif
     ReleasePause();
 #if defined(_WIN32)
     edf::native::LogNativeCoverageCensusFinal();
@@ -425,6 +707,16 @@ class Edf2017App : public rex::ReXApp {
     return true;
   }
  private:
+#if defined(EDF2027_BUILD_MULTIPLAYER)
+  edf::net::ServerBrowserScanCoordinator server_browser_scans_;
+  edf::net::LocalServerHost local_server_host_;
+
+  void DetachLocalServerHostFromEngine() {
+    const auto bridge = edf::GetLocalHostEngineBridge();
+    std::lock_guard bridge_lock(bridge->mutex);
+    if (bridge->host == &local_server_host_) bridge->host = nullptr;
+  }
+#endif
 #if defined(_WIN32)
   std::unique_ptr<edf::native::NativePreviewWindow> native_preview_;
   std::shared_ptr<edf::native::GuestMeshWatchAudit> native_mesh_audit_;
@@ -445,8 +737,36 @@ class Edf2017App : public rex::ReXApp {
     }
     OpenSettings();
   }
+#if defined(EDF2027_BUILD_MULTIPLAYER)
+  void OpenServerBrowser() {
+    if (auto* current = edf::net::ServerBrowserDialog::Current()) {
+      current->Dismiss();
+      return;
+    }
+    if (!imgui_drawer() || edf::net::ServerBrowserDialog::Current()) return;
+    if (auto* settings = edf::SettingsDialog::Current()) settings->Dismiss();
+    if (auto* console = edf::console::ConsoleDialog::Current(); console && console->open()) console->SetOpen(false);
+    if (booted_) BeginPause();
+    auto* dialog = new edf::net::ServerBrowserDialog(imgui_drawer(), edf::net::ClientSession::Global(),
+        server_browser_scans_, [this](std::string_view, std::string* error) {
+      const auto scripts_directory = rex::filesystem::GetExecutableFolder() / "server-data" / "scripts";
+      if (!local_server_host_.Start(scripts_directory, error)) return false;
+      return true;
+    }, [this] { return local_server_host_.running(); }, [this] {
+      local_server_host_.Stop();
+    }, [this] {
+      SaveConfig();
+      if (booted_) EndPause();
+    });
+    edf::net::ServerBrowserDialog::Current() = dialog;
+    imgui_drawer()->AddDialog(dialog);
+  }
+#endif
   void OpenSettings(bool by_pad = false) {
     if (edf::SettingsDialog::Current() || !imgui_drawer()) return;
+#if defined(EDF2027_BUILD_MULTIPLAYER)
+    if (auto* browser = edf::net::ServerBrowserDialog::Current()) browser->Dismiss();
+#endif
     // One owner of the input gate at a time: the menu replaces the console.
     if (auto* console = edf::console::ConsoleDialog::Current(); console && console->open()) console->SetOpen(false);
     BeginPause();

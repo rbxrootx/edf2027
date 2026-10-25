@@ -160,7 +160,11 @@ void StartKernelTickTimer(rex::Runtime* runtime) {
   wait_item->Disarm();
   auto* tick_count = runtime->memory()->TranslateVirtual<uint8_t*>(bundle_export->variable_ptr) + 16;
   g_tick = new TickThread{timer, stop, {}};
-  g_tick->thread = std::thread(TickThreadMain, timer, stop, tick_count, REXCVAR_GET(edf_frametime_log));
+  bool log_timer = false;
+#if !defined(EDF2027_HEADLESS_GUEST)
+  log_timer = REXCVAR_GET(edf_frametime_log);
+#endif
+  g_tick->thread = std::thread(TickThreadMain, timer, stop, tick_count, log_timer);
   REXLOG_INFO("EDF2027: kernel tick (KeTimeStampBundle {:08X}) updated by a 1 ms high-resolution waitable timer",
               bundle_export->variable_ptr);
 #else
@@ -178,6 +182,14 @@ void StopKernelTickTimer() {
   CloseHandle(g_tick->stop);
   delete g_tick;
   g_tick = nullptr;
+#endif
+}
+
+bool KernelTickTimerRunning() noexcept {
+#if defined(_WIN32)
+  return g_tick != nullptr;
+#else
+  return false;
 #endif
 }
 }  // namespace edf

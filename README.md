@@ -1,4 +1,4 @@
-# EDF2027: EDF 3 recompilation from the 360 version (v0.3.0-beta)
+# EDF2027: EDF 3 recompilation from the 360 version (v0.3.38-beta)
 
 ![The in-game console types "spawn ant 1000 80" and a thousand giant ants pour down the Mission 1 street](docs/media/horde-1000-ants.gif)
 
@@ -29,6 +29,15 @@ should work too.
   with the stock translation, with identical results.
 - **In-game console:** spawn hundreds of enemies, collapse buildings, run
   scripts ([docs/console.md](docs/console.md)).
+- **Self-hosted multiplayer foundation (experimental):** a headless ENet
+  server, LAN browser, direct IP join, optional self-hosted directory,
+  Docker Compose server setup, signed server identities, encrypted/replay-checked
+  ENet packets, server-side Luau hooks, experimental host ant state/removal sync,
+  and a guest-host bridge. F5 local hosts preserve EDF movement and collision;
+  the host pose comes from the local guest and remote client poses are relayed
+  with a server-side speed bound.
+  Shared mission combat and its headless Mission 1 route remain unverified.
+  ([docs/multiplayer.md](docs/multiplayer.md)).
 - **Low input latency:** median input-to-photon 18 ms instead of 42 ms.
 - **AMD FSR 3.1** anti-aliasing, **any resolution and aspect ratio** (21:9 and
   32:9 Hor+, HUD kept in 16:9).
@@ -95,6 +104,7 @@ type.
 | Arrows | Menu navigation | R | Pad X |
 | Enter | Start / pause | Tab | Back: retire |
 | F / C | L3 / R3 | G | Reload (optional) |
+| F5 | Multiplayer server browser | | |
 
 ![Controls section with the key bindings](docs/media/menu-controls.jpg)
 
@@ -104,8 +114,10 @@ Everything can be rebound in **F1 > Controls**.
 
 - **Black window or GPU error:** try *Graphics > Renderer > Classic*, then the
   Direct3D 11 fallback.
-- **Missing DLL:** `rexruntime.dll`, `amd_fidelityfx_dx12.dll` and the bundled
-  Visual C++ DLLs must be next to `edf2027.exe`.
+- **Missing DLL:** `rexruntime.dll`, `d3dcompiler_47.dll` and the bundled
+  Visual C++ DLLs must be next to `edf2027.exe`. The native FSR option also
+  needs `amd_fidelityfx_dx12.dll`; without it, the game still runs and FSR is
+  unavailable in the graphics settings.
 - **"Not Earth Defense Force 2017":** only the USA/Europe release is supported.
 - **Bug reports:** each run writes a log to `logs\` next to the executable (or
   `%APPDATA%\edf2027\logs`), and a crash writes a `.dmp` there. Attach both.

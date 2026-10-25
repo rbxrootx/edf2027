@@ -5,7 +5,9 @@ These files are Microsoft's, not part of this project, and are included unmodifi
 the game runs without a separate installer and loads known-good versions from its own
 folder:
 
-  msvcp140.dll, msvcp140_atomic_wait.dll, vcruntime140.dll, vcruntime140_1.dll
+  concrt140.dll, msvcp140.dll, msvcp140_1.dll, msvcp140_2.dll,
+  msvcp140_atomic_wait.dll, msvcp140_codecvt_ids.dll, vccorlib140.dll,
+  vcruntime140.dll, vcruntime140_1.dll, vcruntime140_threads.dll
       Microsoft Visual C++ runtime, from the Visual Studio "Redist" folder
       (VC\Redist\MSVC\<version>\x64\Microsoft.VC14x.CRT). Redistributed under the
       Microsoft Visual Studio license terms for distributable code (app-local deployment).

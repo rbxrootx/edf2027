@@ -4,8 +4,8 @@
 #pragma once
 
 namespace edf::version {
-const char* Version();   // "0.3.0-beta"
+const char* Version();   // release version from CMake
 const char* GitHash();   // "abc1234", or "nogit" when built outside a git checkout
 bool Dirty();            // tracked files differed from the commit when this was built
-const char* Full();      // "0.3.0-beta+abc1234", with ".dirty" appended when Dirty()
+const char* Full();      // release version plus git hash, with ".dirty" appended when Dirty()
 }  // namespace edf::version

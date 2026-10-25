@@ -11,6 +11,8 @@
 #include "../../bridge/native_cvars.h"
 #include "../../bridge/bridge_state.h"
 #include "../../bridge/bridge_helpers.h"
+#include "console/console_guest.h"
+#include "multiplayer/mission_actor_trace.h"
 #include <rex/hook.h>
 #include <rex/cvar.h>
 #include <rex/ppc/func.h>
@@ -39,7 +41,18 @@
 #include <utility>
 #include <vector>
 
+REXCVAR_DEFINE_BOOL(edf_mp_actor_trace,false,"EDF2027",
+    "Trace mission ant spawns/removals and received host samples (development; read-only)");
+REXCVAR_DEFINE_BOOL(edf_mp_mission_actor_reconcile,false,"EDF2027/Multiplayer",
+    "Experimental: apply host mission-ant state to matching spawn keys (may match the wrong mission/actor)");
+
 namespace {
+std::atomic<bool> mission_actor_network_replication_active{false};
+
+bool MissionActorTraceCaptureEnabled() {
+  return REXCVAR_GET(edf_mp_actor_trace);
+}
+
 // Observational resource-worker boundaries. The persistent coordinator/helper
 // are not BeginLoading/EndLoading transactions; preserve their original calls.
 class ScriptLoadTiming {
@@ -61,6 +74,120 @@ class ScriptLoadTiming {
   std::chrono::steady_clock::time_point start_{};
 };
 thread_local uint32_t map_load_depth=0;
+constexpr size_t kMissionNativeSelectors=128;
+std::array<std::atomic<uint32_t>,kMissionNativeSelectors> mission_native_samples{};
+std::atomic<uint32_t> mission_factory_other_samples{0},mission_factory_candidate_samples{0};
+std::atomic<uint32_t> mission_factory_faction_samples{0};
+std::atomic<uint32_t> mission_player_index_init_samples{0},mission_player_count_samples{0};
+std::atomic<uint32_t> mission_ant_spawn_samples{0};
+std::atomic<uint32_t> mission_actor_trace_removals{0};
+std::atomic<uint64_t> mission_actor_trace_generation{0};
+std::atomic<bool> mission_actor_trace_pending{false};
+constexpr uint32_t kMissionActorTraceCallLimit=4096;
+// The current factory returns one object per invocation, so each accepted ant
+// gets its own call ordinal and the per-call ant ordinal remains zero. Keep
+// the lifetime bound aligned with the host's 4,096-entry actor registry.
+constexpr uint32_t kMissionActorTraceAntLifetimeLimit=4096;
+constexpr uint32_t kMissionActorTraceAntOrdinalLimit=64;
+
+struct MissionAntTraceObject {
+  uint64_t generation=0;
+  uint32_t call_ordinal=0,ant_ordinal=0,vtable=0;
+};
+std::unordered_map<uint32_t,MissionAntTraceObject> mission_actor_trace_objects;
+
+struct MissionAntSpawnTraceRecord {
+  uint64_t generation=0;
+  uint32_t call_ordinal=0,ant_ordinal=0,caller=0;
+  uint32_t r3=0,r4=0,r5=0,r6=0,r7=0;
+  uint64_t f1_bits=0;
+  uint32_t object=0,vtable=0,faction=0;
+  uint8_t awaken_latch_after=0;
+  float health=0,x=0,y=0,z=0,yaw=0;
+  bool yaw_valid=false;
+};
+std::mutex mission_actor_trace_mutex;
+std::vector<MissionAntSpawnTraceRecord> mission_actor_trace_records;
+
+void ResetMissionActorTrace() {
+  mission_actor_trace_generation.fetch_add(1,std::memory_order_relaxed);
+  mission_ant_spawn_samples.store(0,std::memory_order_relaxed);
+  mission_actor_trace_removals.store(0,std::memory_order_relaxed);
+  mission_actor_trace_objects.clear();
+  std::lock_guard lock(mission_actor_trace_mutex);
+  mission_actor_trace_records.clear();
+  mission_actor_trace_pending.store(false,std::memory_order_relaxed);
+}
+
+void QueueMissionAntSpawnTrace(MissionAntSpawnTraceRecord record) {
+  std::lock_guard lock(mission_actor_trace_mutex);
+  mission_actor_trace_records.push_back(record);
+  mission_actor_trace_pending.store(true,std::memory_order_release);
+}
+
+void FlushMissionActorTrace() {
+  if(!mission_actor_trace_pending.exchange(false,std::memory_order_acq_rel)) return;
+  std::vector<MissionAntSpawnTraceRecord> records;
+  {
+    std::lock_guard lock(mission_actor_trace_mutex);
+    records.swap(mission_actor_trace_records);
+  }
+  for(const auto& record:records) REXLOG_INFO(
+      "Mission ant identity trace: side=client generation={} call_ordinal={} ant_ordinal={} caller={:#x} args=[{:#x},{:#x},{:#x},{:#x},{:#x}] f1_bits={:#x} r7_awaken_gate={} object={:#x} vtable={:#x} class=clGiantAnt faction={} awaken_latch_after={} health={} x={} y={} z={} yaw_valid={} yaw_rad={}",
+      record.generation,record.call_ordinal,record.ant_ordinal,record.caller,
+      record.r3,record.r4,record.r5,record.r6,record.r7,record.f1_bits,
+      record.r7!=0,record.object,record.vtable,record.faction,record.awaken_latch_after,
+      record.health,record.x,record.y,
+      record.z,record.yaw_valid,record.yaw);
+}
+
+bool IsPlayerConstructionCandidate(const std::string& class_name) {
+  return class_name.find("Player")!=std::string::npos ||
+      class_name.find("Soldier")!=std::string::npos ||
+      class_name.find("Camera")!=std::string::npos;
+}
+
+std::string ReadGuestWidePath(uint8_t* base,uint32_t object) {
+  try {
+    // The same 32-byte MSVC std::wstring layout is used by console_game.cpp:
+    // buffer at +4, size at +20, capacity at +24, with seven inline wchar_t slots.
+    const edf::native::GuestReader reader(base);
+    const uint32_t size=reader.Word(reader.Add(object,20));
+    const uint32_t capacity=reader.Word(reader.Add(object,24));
+    if(size>512 || capacity<size || capacity>4096) return "<invalid-length>";
+    if(!size) return {};
+    const uint32_t inline_buffer=reader.Add(object,4);
+    const uint32_t data=capacity>7 ? reader.Word(inline_buffer) : inline_buffer;
+    const auto* bytes=reader.Bytes(data,size_t(size)*2);
+    std::string path;
+    path.reserve(size);
+    for(uint32_t i=0;i<size;++i) {
+      const uint16_t character=uint16_t(bytes[i*2])<<8 | uint16_t(bytes[i*2+1]);
+      if(character==0) break;
+      path.push_back(character<=0x7F ? char(character) : '?');
+    }
+    return path;
+  } catch(...) {
+    return "<unreadable>";
+  }
+}
+
+void TracePlayerSetupCall(const char* function,std::atomic<uint32_t>& samples,
+    uint32_t caller,uint32_t r3,uint32_t r4,uint32_t r5,uint32_t r6,uint32_t result) {
+  if(!LoadTraceOn()) return;
+  const uint32_t sample=samples.fetch_add(1,std::memory_order_relaxed);
+  if(sample>=16) return;
+  REXLOG_INFO("Player seat setup sample: function={} sample={} caller={:#x} r3={:#x} r4={:#x} r5={:#x} r6={:#x} result_r3={:#x}",
+    function,sample,caller,r3,r4,r5,r6,result);
+}
+
+void ResetMissionConstructionTraceSamples() {
+  for(auto& sample:mission_native_samples) sample.store(0,std::memory_order_relaxed);
+  mission_factory_other_samples.store(0,std::memory_order_relaxed);
+  mission_factory_candidate_samples.store(0,std::memory_order_relaxed);
+  mission_factory_faction_samples.store(0,std::memory_order_relaxed);
+  mission_player_index_init_samples.store(0,std::memory_order_relaxed);
+  mission_player_count_samples.store(0,std::memory_order_relaxed);
 }
 REX_EXTERN(__imp__sub_820CBD28);
 REX_HOOK_RAW(sub_820CBD28) {
@@ -82,8 +209,13 @@ REX_HOOK_RAW(sub_820CBD28) {
 REX_EXTERN(__imp__sub_820CD448);
 REX_HOOK_RAW(sub_820CD448) {
   const uint32_t caller=uint32_t(ctx.lr);
+  if(LoadTraceOn()) ResetMissionConstructionTraceSamples();
+  // Keep mission spawn identities even before networking starts. A client can
+  // join a running mission and still match actors that were created earlier.
+  ResetMissionActorTrace();
   LoadTraceEvent("mission_begin",caller);
   __imp__sub_820CD448(ctx,base);
+  FlushMissionActorTrace();
   LoadTraceEvent("mission_begin_end",caller);
 }
 // Inclusive nested timings, restricted to this thread's LoadMap call chain.
@@ -139,14 +271,150 @@ REX_HOOK_RAW(sub_820C7220) {
 REX_EXTERN(__imp__sub_820D1518);
 REX_HOOK_RAW(sub_820D1518) {
   ScriptLoadTiming timing("mission",ctx.r6.u32,ctx.r7.u32);
-  if(!LoadTraceOn()) { __imp__sub_820D1518(ctx,base); return; }
-  const auto native=(std::min)(size_t(ctx.r7.u32),NativeLoadTraceState::kNatives-1);
+  if(!LoadTraceOn()) { __imp__sub_820D1518(ctx,base); FlushMissionActorTrace(); return; }
+  // The dispatcher selects its native with r7 & 0x7f. Keep the incoming
+  // registers verbatim as evidence until their script-value layout is known.
+  const uint32_t caller=uint32_t(ctx.lr);
+  const uint32_t r3=ctx.r3.u32,r4=ctx.r4.u32,r5=ctx.r5.u32,r6=ctx.r6.u32,r7=ctx.r7.u32;
+  const auto native=(std::min)(size_t(r7 & 0x7f),NativeLoadTraceState::kNatives-1);
   const auto start=std::chrono::steady_clock::now();
   __imp__sub_820D1518(ctx,base);
+  FlushMissionActorTrace();
   auto& state=LoadTraceState();
   state.native_calls[native].fetch_add(1,std::memory_order_relaxed);
   state.native_nanos[native].fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
     std::chrono::steady_clock::now()-start).count()),std::memory_order_relaxed);
+  // At most two raw samples for each of 128 selectors; no guest pointers are
+  // dereferenced here because the BVM argument encoding is not decoded yet.
+  const uint32_t sample=mission_native_samples[native].fetch_add(1,std::memory_order_relaxed);
+  if(sample<2) REXLOG_INFO("Mission native dispatch sample: selector={} sample={} r7={:#x} caller={:#x} r3={:#x} r4={:#x} r5={:#x} r6={:#x} result_r3={:#x}",
+    native,sample,r7,caller,r3,r4,r5,r6,ctx.r3.u32);
+}
+// Native #300 creates mission objects. Preserve raw entry values as opaque
+// evidence; only inspect the returned object after validating its heap range.
+REX_EXTERN(__imp__sub_820CEBD0);
+REX_HOOK_RAW(sub_820CEBD0) {
+  if(mission_ant_spawn_samples.load(std::memory_order_relaxed)>=kMissionActorTraceAntLifetimeLimit) {
+    __imp__sub_820CEBD0(ctx,base);
+    return;
+  }
+  const uint32_t caller=uint32_t(ctx.lr);
+  const uint32_t r3=ctx.r3.u32,r4=ctx.r4.u32,r5=ctx.r5.u32,r6=ctx.r6.u32,r7=ctx.r7.u32;
+  const uint64_t f1_bits=ctx.f1.u64;
+  __imp__sub_820CEBD0(ctx,base);
+
+  const uint32_t object=ctx.r3.u32;
+  if(!edf::console::GuestMemory::Heap(object,738)) return;
+  const edf::console::GuestMemory memory(base);
+  if(memory.ClassName(object)!="clGiantAnt") return;
+  const uint32_t faction=memory.U32(object+604);
+  if(faction!=1) return;
+  const uint32_t call_ordinal=mission_ant_spawn_samples.fetch_add(1,std::memory_order_relaxed);
+  if(call_ordinal>=kMissionActorTraceAntLifetimeLimit) return;
+  constexpr uint32_t ant_ordinal=0;
+
+  const uint64_t generation=mission_actor_trace_generation.load(std::memory_order_relaxed);
+  const uint32_t vtable=memory.U32(object);
+  mission_actor_trace_objects.insert_or_assign(object,
+      MissionAntTraceObject{generation,call_ordinal,ant_ordinal,vtable});
+  if(MissionActorTraceCaptureEnabled()) {
+    const float health=memory.F32(object+592);
+    const float x=memory.F32(object+272),y=memory.F32(object+276),z=memory.F32(object+280);
+    const float forward_x=memory.F32(object+256),forward_z=memory.F32(object+264);
+    if(std::isfinite(health)&&std::isfinite(x)&&std::isfinite(y)&&std::isfinite(z)&&
+       std::isfinite(forward_x)&&std::isfinite(forward_z)) {
+      const bool yaw_valid=std::abs(forward_x)>=1e-6f||std::abs(forward_z)>=1e-6f;
+      const float yaw=yaw_valid?std::atan2(forward_x,forward_z):0.0f;
+      const uint8_t awaken_latch_after=memory.U8(object+737);
+      QueueMissionAntSpawnTrace({generation,
+          call_ordinal,ant_ordinal,caller,r3,r4,r5,r6,r7,f1_bits,object,vtable,faction,
+          awaken_latch_after,health,x,y,z,yaw,yaw_valid});
+    }
+  }
+}
+void TraceMissionAntRemovalImpl(uint8_t* base,uint32_t object,uint32_t caller) {
+  const auto tracked=mission_actor_trace_objects.find(object);
+  if(tracked!=mission_actor_trace_objects.end()) {
+    const MissionAntTraceObject trace=tracked->second;
+    mission_actor_trace_objects.erase(tracked);
+    if(MissionActorTraceCaptureEnabled() &&
+        trace.generation==mission_actor_trace_generation.load(std::memory_order_relaxed) &&
+        edf::console::GuestMemory::Heap(object,738)) {
+      const edf::console::GuestMemory memory(base);
+      if(memory.U32(object)==trace.vtable && memory.ClassName(object)=="clGiantAnt") {
+        const uint32_t removal_ordinal=mission_actor_trace_removals.fetch_add(1,std::memory_order_relaxed);
+        REXLOG_INFO("Mission ant lifecycle trace: side=client generation={} removal_ordinal={} call_ordinal={} ant_ordinal={} caller={:#x} object={:#x} vtable={:#x} class=clGiantAnt faction={} health={} x={} y={} z={}",
+            trace.generation,removal_ordinal,trace.call_ordinal,trace.ant_ordinal,caller,
+            object,trace.vtable,memory.U32(object+604),memory.F32(object+592),
+            memory.F32(object+272),memory.F32(object+276),memory.F32(object+280));
+      }
+    }
+  }
+}
+// The generic object factory reveals the constructed object's RTTI class. For
+// player candidates, decode its SGO path using the std::wstring layout already
+// used by the console's game-thread object factory.
+REX_EXTERN(__imp__sub_821A6E08);
+REX_HOOK_RAW(sub_821A6E08) {
+  const bool trace=LoadTraceOn();
+  const uint32_t caller=uint32_t(ctx.lr);
+  const uint32_t core=ctx.r3.u32,matrix=ctx.r4.u32,path=ctx.r5.u32,params=ctx.r6.u32;
+  __imp__sub_821A6E08(ctx,base);
+  if(!trace || !ctx.r3.u32) return;
+
+  const edf::console::GuestMemory memory(base);
+  const uint32_t object=ctx.r3.u32;
+  const bool heap_object=edf::console::GuestMemory::Heap(object);
+  const uint32_t vtable=heap_object?memory.U32(object):0;
+  const std::string class_name=heap_object?memory.ClassName(object):std::string{};
+  const bool player_candidate=IsPlayerConstructionCandidate(class_name);
+  auto& logs=player_candidate?mission_factory_candidate_samples:mission_factory_other_samples;
+  const uint32_t sample=logs.fetch_add(1,std::memory_order_relaxed);
+  if(sample>=128) return;
+  const std::string path_text=player_candidate?ReadGuestWidePath(base,path):std::string{};
+  const int32_t player_index=class_name=="clPlayerObject" &&
+      edf::console::GuestMemory::Heap(object,496)
+      ? std::bit_cast<int32_t>(memory.U32(object+492)) : -1;
+  REXLOG_INFO("Game object factory sample: group={} sample={} caller={:#x} core={:#x} matrix={:#x} path_object={:#x} path={} params={:#x} object={:#x} vtable={:#x} class={} player_index={} heap_object={}",
+      player_candidate?"player_candidate":"other",sample,caller,core,matrix,path,
+      player_candidate?(path_text.empty()?"<empty>":path_text):"<not-read>",params,object,vtable,
+      class_name.empty()?"<unknown>":class_name,player_index,heap_object);
+}
+
+// clGameObject_Base faction registration follows object construction. Correlate
+// its player index with the factory/path record by object address.
+REX_EXTERN(__imp__sub_820D5ED0);
+REX_HOOK_RAW(sub_820D5ED0) {
+  const uint32_t object=ctx.r3.u32,faction=ctx.r4.u32,notify=ctx.r5.u32;
+  const uint32_t caller=uint32_t(ctx.lr);
+  __imp__sub_820D5ED0(ctx,base);
+  if(!LoadTraceOn()) return;
+  const edf::console::GuestMemory memory(base);
+  const std::string class_name=memory.ClassName(object);
+  if(!IsPlayerConstructionCandidate(class_name)) return;
+  const uint32_t sample=mission_factory_faction_samples.fetch_add(1,std::memory_order_relaxed);
+  if(sample>=128) return;
+  const int32_t player_index=class_name=="clPlayerObject" &&
+      edf::console::GuestMemory::Heap(object,496)
+      ? std::bit_cast<int32_t>(memory.U32(object+492)) : -1;
+  const float health=edf::console::GuestMemory::Heap(object,596)?memory.F32(object+592):0.0f;
+  REXLOG_INFO("Candidate SetFaction sample: sample={} caller={:#x} object={:#x} class={} faction={} notify={} player_index={} health={}",
+    sample,caller,object,class_name,faction,notify,player_index,health);
+}
+
+// Generated input setup routines: log bounded raw registers so a second-seat
+// path can be correlated without assuming their C++ or script argument layouts.
+REX_EXTERN(__imp__sub_820A0220);
+REX_HOOK_RAW(sub_820A0220) {
+  const uint32_t caller=uint32_t(ctx.lr),r3=ctx.r3.u32,r4=ctx.r4.u32,r5=ctx.r5.u32,r6=ctx.r6.u32;
+  __imp__sub_820A0220(ctx,base);
+  TracePlayerSetupCall("820A0220",mission_player_index_init_samples,caller,r3,r4,r5,r6,ctx.r3.u32);
+}
+REX_EXTERN(__imp__sub_820BDC68);
+REX_HOOK_RAW(sub_820BDC68) {
+  const uint32_t caller=uint32_t(ctx.lr),r3=ctx.r3.u32,r4=ctx.r4.u32,r5=ctx.r5.u32,r6=ctx.r6.u32;
+  __imp__sub_820BDC68(ctx,base);
+  TracePlayerSetupCall("820BDC68",mission_player_count_samples,caller,r3,r4,r5,r6,ctx.r3.u32);
 }
 REX_EXTERN(__imp__sub_821A4170);
 REX_HOOK_RAW(sub_821A4170) {
@@ -214,3 +482,49 @@ REX_HOOK_RAW(sub_8216EBC0) {
   LoadTraceEvent("presenter_exit",0);
   native_load_trace_presenter_thread=false;
 }
+
+}  // namespace
+
+namespace edf::multiplayer {
+
+void TraceMissionAntRemoval(uint8_t* guest_base,uint32_t object,uint32_t caller) {
+  ::TraceMissionAntRemovalImpl(guest_base,object,caller);
+}
+
+std::vector<MissionAntTraceKey> SnapshotMissionAntTraceKeys(
+    uint8_t* guest_base,bool include_dead) {
+  std::vector<MissionAntTraceKey> keys;
+  if(!guest_base) return keys;
+  const uint64_t generation=mission_actor_trace_generation.load(std::memory_order_relaxed);
+  if(!generation) return keys;
+  const edf::console::GuestMemory memory(guest_base);
+  keys.reserve(mission_actor_trace_objects.size());
+  for(const auto& [object,trace]:mission_actor_trace_objects) {
+    if(trace.generation!=generation || trace.call_ordinal>=kMissionActorTraceCallLimit ||
+       trace.ant_ordinal>=kMissionActorTraceAntOrdinalLimit ||
+       !edf::console::GuestMemory::Heap(object,738) || memory.U32(object)!=trace.vtable ||
+       memory.ClassName(object)!="clGiantAnt" || memory.U32(object+604)!=1) continue;
+    if(!include_dead) {
+      const float health=memory.F32(object+592);
+      const float x=memory.F32(object+272),y=memory.F32(object+276),z=memory.F32(object+280);
+      if(memory.U8(object+624)!=0 || !std::isfinite(health) || health<=0.0f ||
+         !std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) continue;
+    }
+    keys.push_back({generation,trace.call_ordinal,trace.ant_ordinal,object});
+  }
+  return keys;
+}
+
+uint64_t CurrentMissionAntTraceGeneration() {
+  return mission_actor_trace_generation.load(std::memory_order_relaxed);
+}
+
+void SetMissionActorNetworkReplicationActive(bool active) {
+  mission_actor_network_replication_active.store(active, std::memory_order_relaxed);
+}
+
+bool MissionActorNetworkReplicationActive() {
+  return mission_actor_network_replication_active.load(std::memory_order_relaxed);
+}
+
+}  // namespace edf::multiplayer

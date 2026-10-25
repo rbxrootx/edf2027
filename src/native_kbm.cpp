@@ -15,6 +15,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -34,6 +35,9 @@
 #include "native_kbm.h"
 #include "native_kbm_logic.h"
 #include "pause_menu.h"
+#if defined(EDF2027_BUILD_MULTIPLAYER)
+#include "multiplayer/client_input.h"
+#endif
 
 REXCVAR_DEFINE_BOOL(edf_kbm, true, "EDF2027", "Native keyboard and mouse input (not pad emulation)");
 REXCVAR_DEFINE_BOOL(edf_kbm_mouse_look, true, "EDF2027", "Aim with the mouse");
@@ -160,6 +164,47 @@ TechnicalBindings ReadBindings(const uint8_t* base) {
   return bindings;
 }
 
+#if defined(EDF2027_BUILD_MULTIPLAYER)
+void SetNetworkButton(edf::net::InputCommand& input, PadControl control) {
+  switch (control) {
+    case PadControl::kA: input.buttons |= edf::menu::kPadA; break;
+    case PadControl::kB: input.buttons |= edf::menu::kPadB; break;
+    case PadControl::kX: input.buttons |= edf::menu::kPadX; break;
+    case PadControl::kY: input.buttons |= edf::menu::kPadY; break;
+    case PadControl::kLeftShoulder: input.buttons |= edf::menu::kPadLeftShoulder; break;
+    case PadControl::kRightShoulder: input.buttons |= edf::menu::kPadRightShoulder; break;
+    case PadControl::kLeftTrigger: input.left_trigger = 255; break;
+    case PadControl::kRightTrigger: input.right_trigger = 255; break;
+    case PadControl::kLeftThumb: input.buttons |= edf::menu::kPadLeftThumb; break;
+    case PadControl::kRightThumb: input.buttons |= edf::menu::kPadRightThumb; break;
+    case PadControl::kCount: break;
+  }
+}
+
+int16_t NetworkAxis(float value) {
+  const float bounded = std::clamp(value, -1.0f, 1.0f);
+  return static_cast<int16_t>(std::lround(bounded * 32767.0f));
+}
+
+void PublishKeyboardInput(const ChannelFrame& frame, const MouseRouter::Stick& stick) {
+  edf::net::InputCommand input;
+  input.move_x = static_cast<int16_t>(frame.move_x * 32767);
+  input.move_y = static_cast<int16_t>(frame.move_y * 32767);
+  input.aim_x = NetworkAxis(stick.x);
+  input.aim_y = NetworkAxis(REXCVAR_GET(edf_kbm_invert_y) ? -stick.y : stick.y);
+  for (size_t i = 0; i < frame.pad.size(); ++i) {
+    if (frame.pad[i]) SetNetworkButton(input, static_cast<PadControl>(i));
+  }
+  if (frame.start) input.buttons |= edf::menu::kPadStart;
+  if (frame.back) input.buttons |= edf::menu::kPadBack;
+  if (frame.menu_x > 0) input.buttons |= edf::menu::kPadRight;
+  if (frame.menu_x < 0) input.buttons |= edf::menu::kPadLeft;
+  if (frame.menu_y > 0) input.buttons |= edf::menu::kPadUp;
+  if (frame.menu_y < 0) input.buttons |= edf::menu::kPadDown;
+  edf::net::PublishLocalKeyboardInput(input);
+}
+#endif
+
 // Caller holds Guest().mutex. Re-parses a bind only when its cvar text changed, so the
 // settings screen's edits apply on the next poll.
 ActionState ReadActions(GuestSide& guest, const KeyState& keys, const std::array<bool, 3>& mouse_buttons) {
@@ -249,6 +294,9 @@ void MergeIntoDevice(uint8_t* base, uint32_t device) {
     guest.router.Reset();
     edf::reload::ResetKeyboard();
     edf::latency::OnInputDiscarded();
+#if defined(EDF2027_BUILD_MULTIPLAYER)
+    edf::net::ClearLocalKeyboardInput();
+#endif
     return;
   }
   // F1 menu (pause_menu.h): nothing reaches the game while it is open, nor after it
@@ -260,6 +308,9 @@ void MergeIntoDevice(uint8_t* base, uint32_t device) {
     guest.router.Reset();
     edf::reload::ResetKeyboard();
     edf::latency::OnInputDiscarded();
+#if defined(EDF2027_BUILD_MULTIPLAYER)
+    edf::net::ClearLocalKeyboardInput();
+#endif
     return;
   }
   // Input latency trace: this poll gives the game everything received so far.
@@ -323,6 +374,9 @@ void MergeIntoDevice(uint8_t* base, uint32_t device) {
 
   if (!REXCVAR_GET(edf_kbm_mouse_look)) {
     guest.router.Reset();
+#if defined(EDF2027_BUILD_MULTIPLAYER)
+    PublishKeyboardInput(frame, {});
+#endif
     return;
   }
   const MouseRouter::Stick stick =
@@ -330,6 +384,9 @@ void MergeIntoDevice(uint8_t* base, uint32_t device) {
   if (stick.x != 0.0f) WriteAxisPair(base, device, kRightX, kRightXReverse, stick.x);
   if (stick.y != 0.0f)
     WriteAxisPair(base, device, kRightY, kRightYReverse, REXCVAR_GET(edf_kbm_invert_y) ? -stick.y : stick.y);
+#if defined(EDF2027_BUILD_MULTIPLAYER)
+  PublishKeyboardInput(frame, stick);
+#endif
 
   static std::atomic<int32_t> traced{0};
   if ((dx != 0.0f || dy != 0.0f || frame.move_x || frame.move_y) && Trace(traced))
@@ -465,8 +522,17 @@ REX_HOOK_RAW(sub_821B09A0) {
   const uint32_t device = ctx.r3.u32;
   __imp__sub_821B09A0(ctx, base);
   // Player 0's pad only: that is where the window-side driver keeps a device connected.
-  if (edf::kbm::Enabled() && device && edf::kbm::Load32(base, device + edf::kbm::kDeviceUser) == 0)
+  if (!edf::kbm::Enabled()) {
+#if defined(EDF2027_BUILD_MULTIPLAYER)
+    edf::net::ClearLocalKeyboardInput();
+#endif
+  } else if (!device) {
+#if defined(EDF2027_BUILD_MULTIPLAYER)
+    edf::net::ClearLocalKeyboardInput();
+#endif
+  } else if (edf::kbm::Load32(base, device + edf::kbm::kDeviceUser) == 0) {
     edf::kbm::MergeIntoDevice(base, device);
+  }
 }
 
 REX_EXTERN(__imp__sub_820DC890);

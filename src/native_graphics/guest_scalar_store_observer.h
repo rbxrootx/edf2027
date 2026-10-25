@@ -51,7 +51,7 @@ template<class T> inline T ObservedScalarStore(uint8_t* base,uint32_t address,T 
     std::source_location site=std::source_location::current()) {
   // Preserve the generated Windows E-alias host offset and volatile access.
   *reinterpret_cast<volatile T*>(base+address+REX_PHYS_HOST_OFFSET(address))=encoded;
-  if(address>=0xa0000000u)
+  if((address>=0xa0000000u) || (address>=0x40000000u && address<0x50000000u))
     edf_native_observe_guest_scalar_store(base,address,sizeof(T),site.file_name(),site.line());
   return encoded;
 }

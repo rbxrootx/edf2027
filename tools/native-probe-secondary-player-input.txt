@@ -1,0 +1,19 @@
+# Mission 1 route for checking whether XInput user 1 is bound to a distinct
+# player object. The diagnostic also feeds this route to user 0 so the primary
+# frontend can reach the mission. Both local players receive the same inputs.
+clock game
+20000 1000 0010
+25000 1000 0010
+30000 1000 1000
+35000 1000 1000
+40000 1000 1000
+45000 1000 1000
+50000 1000 1000
+55000 1000 1000
+60000 1000 1000
+65000 1000 1000
+70000 1000 1000
+# Skip the intro after the title route has selected Mission 1.
+85000 500 0010
+# Move forward after the mission loads; either stick direction establishes motion.
+100000 200000 0000 0 0 0 -32768 0 0

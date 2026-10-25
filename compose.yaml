@@ -1,0 +1,43 @@
+services:
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: edf2027-server:local
+    restart: unless-stopped
+    command:
+      - --name
+      - My EDF Server
+      - --data-dir
+      - /data
+      - --identity-file
+      - /state/identity.edfkey
+      - --port
+      - "27717"
+      - --discovery-port
+      - "27718"
+      - --master
+      - directory:27719
+    environment:
+      EDF_ADVERTISE_IP: ${EDF_ADVERTISE_IP:-}
+    depends_on:
+      - directory
+    ports:
+      - "27717:27717/udp"
+      - "27718:27718/udp"
+    volumes:
+      - ./server-data:/data:ro
+      - server-state:/state
+  directory:
+    image: edf2027-server:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    entrypoint: ["/usr/local/bin/edf2027_master"]
+    command: ["--port", "27719"]
+    ports:
+      - "27719:27719/udp"
+
+volumes:
+  server-state:
